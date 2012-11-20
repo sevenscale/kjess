@@ -8,8 +8,7 @@ module KJess
   # Connection
   class Connection
     class Error < KJess::Error; end
-
-    CRLF = "\r\n"
+    class Timeout < Error; end
 
     # Public:
     # The hostname/ip address to connect to
@@ -19,11 +18,93 @@ module KJess
     # The port number to connect to. Default 22133
     attr_reader :port
 
-    def initialize( host, port = 22133 )
-      @host   = host
-      @port   = Float( port ).to_i
-      @socket = nil
+    # Public
+    # The timeout for connecting in seconds. Defaults to 2
+    attr_accessor :connect_timeout
+
+    # Public
+    # The timeout for reading in seconds. Defaults to 2
+    attr_accessor :read_timeout
+
+    # Public
+    # The timeout for writing in seconds. Defaults to 2
+    attr_accessor :write_timeout
+
+    def initialize( host, port = 22133, options = {} )
+      if port.is_a?(Hash)
+        options = port
+        port = 22133
+      end
+
+      @host            = host
+      @port            = Float( port ).to_i
+
+      @connect_timeout = options[:connect_timeout] || 2
+      @read_timeout    = options[:read_timeout]    || 2
+      @write_timeout   = options[:write_timeout]   || 2
+
+      @socket         = nil
+      @read_buffer    = ''
+      @read_deadline  = nil
+      @write_deadline = nil
+      @pid            = nil
     end
+
+    # Internal: Starts the read timeout deadline for operations
+    #
+    # timeout - the timeout to set in seconds. This value is added to the
+    #           class-wide `read_timeout`
+    #
+    # Returns nothing
+    def with_read_timeout(timeout = nil, &block)
+      if @read_deadline
+        block.call
+      else
+        begin
+          @current_read_timeout = timeout ? timeout + @read_timeout : @read_timeout
+          @read_deadline = Time.now.to_f + @current_read_timeout
+          block.call
+        ensure
+          @current_read_timeout = @read_deadline = nil
+        end
+      end
+    end
+
+    # Internal: Gets the current read timeout
+    #
+    # Returns an Integer
+    def read_timeout_for_deadline
+      timeout = @read_deadline ? @read_deadline - Time.now.to_f : @read_timeout
+      if timeout <= 0
+        raise Timeout, "Could not read from #{host}:#{port} in #{@current_read_timeout} seconds"
+      end
+      timeout
+    end
+
+    # Internal: Starts the write timeout deadline for operations
+    #
+    # Returns nothing
+    def with_write_timeout(&block)
+      if @write_deadline
+        block.call
+      else
+        begin
+          @write_deadline = Time.now.to_f + @write_timeout
+          block.call
+        ensure
+          @write_deadline = nil
+        end
+      end
+    end
+
+    def write_timeout_for_deadline
+      timeout = @write_deadline ? @write_deadline - Time.now.to_f : @write_timeout
+      if timeout <= 0
+        raise Timeout, "Could not write to #{host}:#{port} in #{@write_timeout} seconds"
+      end
+      timeout
+    end
+
 
     # Internal: Return the raw socket that is connected to the Kestrel server
     #
@@ -36,6 +117,7 @@ module KJess
       return @socket if @socket and not @socket.closed?
       @socket = connect()
       @pid = Process.pid
+      @read_buffer = ''
       return @socket
     end
 
@@ -43,28 +125,59 @@ module KJess
     #
     # Returns a TCPSocket
     def connect
-      sock = TCPSocket.new( host, port )
+      exception = nil
 
-      # close file descriptors if we exec or something like that
-      sock.fcntl(Fcntl::F_SETFD, Fcntl::FD_CLOEXEC)
+      # Calculate our timeout deadline
+      deadline = Time.now.to_f + @connect_timeout
 
-      # Disable Nagle's algorithm
-      sock.setsockopt(Socket::IPPROTO_TCP, Socket::TCP_NODELAY, 1)
+      # Lookup address
+      addrs = ::Socket.getaddrinfo(host, nil)
 
-      # limit only to IPv4?
-      # addr = ::Socket.getaddrinfo(host, nil, Socket::AF_INET)
-      # sock = ::Socket.new(::Socket.const_get(addr[0][0]), Socket::SOCK_STREAM, 0)
-      # saddr = ::Socket.pack_sockaddr_in(port, addr[0][3])
+      addrs.each do |addr|
+        timeout = deadline - Time.now.to_f
+        if timeout <= 0
+          raise Timeout, "Could not connect to #{host}:#{port}"
+        end
 
-      # tcp keepalive
-      # :SOL_SOCKET, :SO_KEEPALIVE, :SOL_TCP, :TCP_KEEPIDLE, :TCP_KEEPINTVL, :TCP_KEEPCNT].all?{|c| Socket.const_defined? c}
-      # @sock.setsockopt(Socket::SOL_SOCKET, Socket::SO_KEEPALIVE,  true)
-      # @sock.setsockopt(Socket::SOL_TCP,    Socket::TCP_KEEPIDLE,  keepalive[:time])
-      # @sock.setsockopt(Socket::SOL_TCP,    Socket::TCP_KEEPINTVL, keepalive[:intvl])
-      # @sock.setsockopt(Socket::SOL_TCP,    Socket::TCP_KEEPCNT,   keepalive[:probes])
-      return sock
+        begin
+          sock     = ::Socket.new(addr[4], Socket::SOCK_STREAM, 0)
+          sockaddr = ::Socket.pack_sockaddr_in(port, addr[3])
+
+          # close file descriptors if we exec
+          sock.fcntl(Fcntl::F_SETFD, Fcntl::FD_CLOEXEC)
+
+          # Disable Nagle's algorithm
+          sock.setsockopt(::Socket::IPPROTO_TCP, ::Socket::TCP_NODELAY, 1)
+
+          begin
+            sock.connect_nonblock(sockaddr)
+          rescue Errno::EINPROGRESS
+            if IO.select(nil, [sock], nil, timeout) == nil
+              raise Timeout, "Could not connect to #{host}:#{port}"
+            end
+
+            begin
+              sock.connect_nonblock(sockaddr)
+            rescue Errno::EISCONN
+            rescue => ex
+              exception = ex
+              next
+            end
+          rescue => ex
+            exception = ex
+            next
+          end
+
+          return sock
+        rescue
+          sock.close
+          raise
+        end
+      end
     rescue => e
       raise Error, "Could not connect to #{host}:#{port}: #{e.class}: #{e.message}", e.backtrace
+    else
+      raise Error, "Could not connect to #{host}:#{port}: #{exception.class}: #{exception.message}", exception.backtrace
     end
 
     # Internal: close the socket if it is not already closed
@@ -72,6 +185,7 @@ module KJess
     # Returns nothing
     def close
       @socket.close if @socket and not @socket.closed?
+      @read_buffer = ''
       @socket = nil
     end
 
@@ -90,8 +204,22 @@ module KJess
     #
     # Returns nothing
     def write( msg )
-      $stderr.write "--> #{msg}" if $DEBUG
-      socket.write( msg )
+      with_write_timeout do
+        $stderr.puts "--> #{msg}" if $DEBUG
+
+        begin
+          until msg.length == 0
+            written = socket.syswrite(msg)
+            msg = msg[written, msg.size]
+          end
+        rescue Errno::EWOULDBLOCK, Errno::EINTR, Errno::EAGAIN
+          IO.select(nil, [socket], nil, write_timeout_for_deadline)
+          retry
+        end
+      end
+    rescue Timeout
+      close
+      raise
     rescue => e
       close
       raise Error, "Could not write to #{host}:#{port}: #{e.class}: #{e.message}", e.backtrace
@@ -103,11 +231,22 @@ module KJess
     #
     # Returns a String
     def readline( eom = Protocol::CRLF )
-      while line = socket.readline( eom ) do
-        $stderr.write "<-- #{line}" if $DEBUG
-        break unless line.strip.length == 0
+      with_read_timeout do
+        while true
+          while (idx = @read_buffer.index(eom)) == nil
+            readpartial(4096, @read_buffer)
+          end
+
+          line = @read_buffer.slice!(0, idx + eom.bytesize)
+          $stderr.puts "<-- #{line}" if $DEBUG
+          break unless line.strip.length == 0
+        end
+
+        return line
       end
-      return line
+    rescue Timeout
+      close
+      raise
     rescue EOFError
       close
       return "EOF"
@@ -121,13 +260,30 @@ module KJess
     # args - this method takes the same arguments as IO#read
     #
     # Returns what IO#read returns
-    def read( *args )
-      d = socket.read( *args )
-      $stderr.puts "<-- #{d}" if $DEBUG
-      return d
+    def read( nbytes )
+      with_read_timeout do
+        while @read_buffer.bytesize < nbytes
+          readpartial(nbytes - @read_buffer.bytesize, @read_buffer)
+        end
+
+        result = @read_buffer.slice!(0, nbytes)
+
+        $stderr.puts "<-- #{result}" if $DEBUG
+        return result
+      end
+    rescue Timeout
+      close
+      raise
     rescue => e
       close
       raise Error, "Could not read from #{host}:#{port}: #{e.class}: #{e.message}", e.backtrace
+    end
+
+    def readpartial(maxlen, outbuf = nil)
+      return socket.sysread(maxlen, outbuf)
+    rescue Errno::EWOULDBLOCK, Errno::EAGAIN
+      IO.select([socket], nil, nil, read_timeout_for_deadline)
+      retry
     end
   end
 end
