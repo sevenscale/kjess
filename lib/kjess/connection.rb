@@ -111,7 +111,7 @@ module KJess
       @read_buffer = ''
       return @socket
     rescue => e
-      raise Error, "Could not connect to #{host}:#{port}: #{e.class}: #{e.message}", e.backtrace
+      raise Error, "Could not connect to #{@options[:host]}:#{@options[:port]}: #{e.class}: #{e.message}", e.backtrace
     end
 
     # Internal: close the socket if it is not already closed
